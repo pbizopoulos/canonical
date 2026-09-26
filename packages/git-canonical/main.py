@@ -276,7 +276,11 @@ def home_repositories(
         if not separator or match is None:
             msg = "malformed .gitmodules field"
             raise CommandError(msg)
-        grouped.setdefault(match.group(1), {})[match.group(2)] = value
+        fields = grouped.setdefault(match.group(1), {})
+        if match.group(2) in fields:
+            msg = f'submodule "{match.group(1)}": duplicate {match.group(2)} field'
+            raise CommandError(msg)
+        fields[match.group(2)] = value
     repositories = []
     for name, fields in sorted(grouped.items()):
         required = {"path", "url"} if require_url else {"path"}
@@ -316,6 +320,31 @@ def _converge_home_ignore(root: Path, *, dry_run: bool) -> bool:
             root,
             Path(".gitignore"),
             source,
+            dry_run=dry_run,
+        )
+    return changed
+
+
+def _allow_home_submodule(root: Path, relative: Path, *, dry_run: bool = False) -> bool:
+    """Allow a submodule and its parents through the home whitelist."""
+    changed = _converge_home_ignore(root, dry_run=dry_run)
+    path = root / ".gitignore"
+    source = _read_regular(path) or "*\n!/.gitignore\n!/.gitmodules\n"
+    patterns = [
+        *(
+            f"!/{parent.as_posix()}/"
+            for parent in reversed(relative.parents)
+            if parent != Path()
+        ),
+        f"!/{relative.as_posix()}",
+    ]
+    existing = set(source.splitlines())
+    missing = [pattern for pattern in patterns if pattern not in existing]
+    if missing:
+        changed |= _write_managed(
+            root,
+            Path(".gitignore"),
+            source.rstrip("\n") + "\n" + "\n".join(missing) + "\n",
             dry_run=dry_run,
         )
     return changed
@@ -459,6 +488,8 @@ def check_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: FBT0
         msg = "stage .gitmodules with git add before moving submodules"
         raise CommandError(msg)
     changed = _converge_home_ignore(root, dry_run=dry_run)
+    for expected in expected_paths:
+        changed |= _allow_home_submodule(root, expected, dry_run=dry_run)
     for repository, expected in zip(repositories, expected_paths, strict=True):
         changed |= _converge_home_repository(
             root,
@@ -691,31 +722,14 @@ def _python_test_placement_issue(package: Package) -> str | None:
 
 
 def has_python_tests(path: Path) -> bool:
-    """Detect pytest-style tests without executing package source."""
+    """Detect the same static tests reported by the test names command."""
     try:
-        module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        return bool(source_test_names(path.read_bytes(), str(path)))
     except (OSError, SyntaxError, UnicodeError) as error:
         msg = f"{path}: Python source could not be parsed: {error}"
         raise CommandError(
             msg,
         ) from error
-    for node in module.body:
-        if isinstance(
-            node,
-            (ast.FunctionDef, ast.AsyncFunctionDef),
-        ) and node.name.startswith("test_"):
-            return True
-        if (
-            isinstance(node, ast.ClassDef)
-            and node.name.startswith("Test")
-            and any(
-                isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and child.name.startswith("test_")
-                for child in node.body
-            )
-        ):
-            return True
-    return False
 
 
 def package_description(package: Package) -> str | None:
@@ -1560,7 +1574,7 @@ def add_package(root: Path, kind: str, name: str, description: str | None) -> No
             created.append(path)
         _refresh_gitignore(root)
         generated = [str(path.relative_to(root)) for path in created] + [".gitignore"]
-        completed = git(root, ["add", "--force", "--", *generated], check=False)
+        completed = git(root, ["add", "--", *generated], check=False)
         if completed.returncode != 0:
             raise CommandError(completed.stderr.strip() or "git add failed")  # noqa: TRY301
     except BaseException:
@@ -1596,7 +1610,6 @@ def add_host(root: Path, name: str) -> None:
             root,
             [
                 "add",
-                "--force",
                 "--",
                 str(relative),
                 str(check_relative),
@@ -1745,8 +1758,20 @@ def initialize_submodule(remote: str) -> None:
     if repository_root(home) != home or profile(home) != "home":
         message = "$HOME must be an initialized canonical home repository"
         raise CommandError(message)
+    _allow_home_submodule(home, relative)
+    registered = any(
+        Path(repository["path"]) == relative and repository["url"] == remote
+        for repository in home_repositories(home)
+    )
+    indexed = git(home, ["ls-files", "--stage", "--", str(relative)]).stdout
+    if (
+        registered
+        and indexed.startswith("160000 ")
+        and (home / relative / ".git").exists()
+    ):
+        return
     completed = subprocess.run(  # noqa: S603
-        ["git", "submodule", "add", "-f", "--", remote, relative.as_posix()],  # noqa: S607
+        ["git", "submodule", "add", "--", remote, relative.as_posix()],  # noqa: S607
         cwd=home,
         check=False,
     )
@@ -1814,12 +1839,12 @@ def initialize_flake(remote: str) -> None:
         with contextlib.suppress(OSError):
             directory.parent.rmdir()
         raise
+    _allow_home_submodule(home, relative)
     git(
         home,
         [
             "submodule",
             "add",
-            "--force",
             "--name",
             relative.as_posix(),
             remote,

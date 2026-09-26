@@ -218,6 +218,43 @@ def test_invalid_source_is_rejected_before_cleanup(repository: Path) -> None:
         raise AssertionError(message)
 
 
+def test_unittest_methods_drive_checks_and_source_validation(repository: Path) -> None:
+    """Discover aliased unittest cases consistently in tests and package source."""
+    _run(repository, "add", "packages/example", "python")
+    package = repository / "packages/example"
+    tests = package / "test_main.py"
+    tests.write_text(
+        "from unittest import TestCase as Case\n"
+        "class Behavior(Case):\n    def test_result(self): pass\n",
+        encoding="utf-8",
+    )
+    _run(repository, "converge")
+    check = repository / "checks/example/default.nix"
+    if (
+        not check.is_file()
+        or "checks/example/default.nix"
+        not in _git(
+            repository,
+            "ls-files",
+        ).splitlines()
+    ):
+        message = "unittest methods did not generate a staged check"
+        raise AssertionError(message)
+    source = package / "main.py"
+    source.write_text(
+        source.read_text(encoding="utf-8") + tests.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    artifact = repository / "work-in-progress"
+    artifact.write_text("keep", encoding="utf-8")
+    result = _run(repository, "converge", code=1)
+    if "move test definitions to test_main.py" not in result.stderr:
+        raise AssertionError(result.stderr)
+    if artifact.read_text(encoding="utf-8") != "keep":
+        message = "failed validation cleaned unrelated work"
+        raise AssertionError(message)
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -277,7 +314,7 @@ def test_cli_help_and_retired_commands(tmp_path: Path) -> None:
         "git@example.test:team/project.git",
     ],
 )
-def test_init_remote_adds_a_home_submodule_and_preserves_git_failures(
+def test_init_remote_adds_a_home_submodule_and_preserves_git_failures(  # noqa: C901
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remote: str,
@@ -322,6 +359,17 @@ def test_init_remote_adds_a_home_submodule_and_preserves_git_failures(
     relative = "example.test/team/project"
     result = _run(tmp_path, "init", remote)
     checkout = home / relative
+    ignore = (home / ".gitignore").read_text(encoding="utf-8")
+    for pattern in (
+        "!/example.test/",
+        "!/example.test/team/",
+        "!/example.test/team/project",
+    ):
+        if ignore.splitlines().count(pattern) != 1:
+            raise AssertionError(ignore)
+    if _git(home, "show", ":.gitignore") != ignore:
+        message = "init REMOTE did not stage the home whitelist"
+        raise AssertionError(message)
     if (checkout / "README").read_text() != "existing repository":
         raise AssertionError(result.stdout + result.stderr)
     if _git(home, "rev-parse", "HEAD") != head:
@@ -343,9 +391,12 @@ def test_init_remote_adds_a_home_submodule_and_preserves_git_failures(
         message = "init REMOTE did not stage the submodule"
         raise AssertionError(message)
     _run(tmp_path, "init", remote)
+    if (home / ".gitignore").read_text(encoding="utf-8") != ignore:
+        message = "repeated init changed the home whitelist"
+        raise AssertionError(message)
     (checkout / ".git").unlink()
     native = subprocess.run(  # noqa: S603
-        ["git", "submodule", "add", "-f", "--", remote, relative],  # noqa: S607
+        ["git", "submodule", "add", "--", remote, relative],  # noqa: S607
         cwd=home,
         capture_output=True,
         text=True,
@@ -357,6 +408,48 @@ def test_init_remote_adds_a_home_submodule_and_preserves_git_failures(
     duplicate = _run(tmp_path, "init", remote, code=native.returncode)
     if duplicate.stderr != native.stderr:
         raise AssertionError(duplicate.stderr)
+
+
+def test_init_flake_stages_home_whitelist_without_force(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Register an empty remote through the home whitelist."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    origin = tmp_path / "remote.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "--quiet")
+    remote = "https://example.test/team/new.git"
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{origin.as_uri()}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.test")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.test")
+    fake_nix = tmp_path / "nix"
+    fake_nix.write_text(
+        '#!/bin/sh\nif [ "$1" = flake ]; then printf "{}\\n" > flake.lock; fi\n',
+        encoding="utf-8",
+    )
+    fake_nix.chmod(0o755)
+    monkeypatch.setenv("GIT_CANONICAL_NIX", str(fake_nix))
+    _run(tmp_path, "init", "home")
+    _git(home, "commit", "--quiet", "-m", "Home policy")
+    _run(tmp_path, "init", "flake", remote)
+    relative = "example.test/team/new"
+    ignore = (home / ".gitignore").read_text(encoding="utf-8")
+    if f"!/{relative}" not in ignore.splitlines():
+        raise AssertionError(ignore)
+    if _git(home, "show", ":.gitignore") != ignore:
+        message = "init flake did not stage the home whitelist"
+        raise AssertionError(message)
+    if not _git(home, "ls-files", "--stage", "--", relative).startswith("160000 "):
+        message = "init flake did not stage its submodule"
+        raise AssertionError(message)
 
 
 @pytest.fixture
@@ -419,6 +512,53 @@ def test_home_convergence_preserves_dirty_and_unpublished_submodule_state(
     _git(root, "add", relative)
     if second not in _git(root, "ls-files", "--stage", relative):
         message = "native Git could not advance the submodule commit"
+        raise AssertionError(message)
+
+
+def test_home_convergence_restores_submodule_whitelist(home_repository: Path) -> None:
+    """Repair missing whitelist entries for a registered home submodule."""
+    root = home_repository
+    ignore = root / ".gitignore"
+    expected = ignore.read_text(encoding="utf-8")
+    ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n", encoding="utf-8")
+    before = _git(root, "show", ":.gitignore")
+    preview = _run(root, "converge", "--dry-run", code=1)
+    if "would write '.gitignore'" not in preview.stdout:
+        raise AssertionError(preview.stdout)
+    if (
+        ignore.read_text(encoding="utf-8") == expected
+        or _git(root, "show", ":.gitignore") != before
+    ):
+        message = "dry-run changed the home whitelist"
+        raise AssertionError(message)
+    _run(root, "converge")
+    if ignore.read_text(encoding="utf-8") != expected:
+        raise AssertionError(ignore.read_text(encoding="utf-8"))
+    if _git(root, "show", ":.gitignore") != expected:
+        message = "convergence did not stage the repaired whitelist"
+        raise AssertionError(message)
+    _run(root, "converge", "--dry-run")
+
+
+def test_home_convergence_rejects_duplicate_submodule_fields(
+    home_repository: Path,
+) -> None:
+    """Reject ambiguous Git configuration instead of silently choosing a URL."""
+    root = home_repository
+    modules = root / ".gitmodules"
+    source = modules.read_text(encoding="utf-8")
+    modules.write_text(
+        source + "url = git@forge.example:owner/other\n",
+        encoding="utf-8",
+    )
+    result = _run(root, "converge", code=1)
+    if "duplicate url field" not in result.stderr:
+        raise AssertionError(result.stderr)
+    if (
+        modules.read_text(encoding="utf-8")
+        != source + "url = git@forge.example:owner/other\n"
+    ):
+        message = "invalid metadata was changed"
         raise AssertionError(message)
 
 
